@@ -10,7 +10,7 @@
 #include <string>
 #include <functional>
 
-#define EDTMRS_VERSION "6.0.0"
+#define EDTMRS_VERSION "5.0.0"
 
 struct DeviceInfo {
     std::string vendor_id;
