@@ -26,51 +26,52 @@ HEARTBEAT_INTERVAL=30
 Set-Content -Path "$agentDir\config.ini" -Value $configContent
 Write-Host "  ✅ config.ini written: SERVER_HOST=$ServerIP" -ForegroundColor Green
 
-# ── Check for CMake + compiler ────────────────────────────────────────────────
+# ── Check for compiler ────────────────────────────────────────────────────────
 Write-Host "[2/3] Checking build tools..." -ForegroundColor Yellow
 
-$hasCmake = Get-Command cmake -ErrorAction SilentlyContinue
 $hasMSVC  = Test-Path "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvarsall.bat"
 $hasMinGW = Get-Command g++ -ErrorAction SilentlyContinue
 
-if ($hasCmake -and ($hasMSVC -or $hasMinGW)) {
-    Write-Host "  ✅ CMake and compiler found" -ForegroundColor Green
+if ($hasMinGW) {
+    # ── Build with MinGW (simple, no CMake needed) ────────────────────────────
+    Write-Host "[3/3] Building with MinGW..." -ForegroundColor Yellow
+    Set-Location $agentDir
 
-    # ── Build with CMake ──────────────────────────────────────────────────────
-    Write-Host "[3/3] Building with CMake..." -ForegroundColor Yellow
-    $buildDir = "$agentDir\build"
-    New-Item -ItemType Directory -Force -Path $buildDir | Out-Null
+    g++ -std=c++17 -O2 -o edtmrs_agent.exe main.cpp device_monitor.cpp http_client.cpp -lwinhttp -lsetupapi -lcfgmgr32 -lws2_32
 
-    Set-Location $buildDir
-    cmake .. -DCMAKE_BUILD_TYPE=Release 2>&1 | Out-Null
-    cmake --build . --config Release
-
-    if (Test-Path "$buildDir\Release\edtmrs_agent.exe") {
-        Copy-Item "$buildDir\Release\edtmrs_agent.exe" "$agentDir\edtmrs_agent.exe" -Force
-        Write-Host "  ✅ Built: endpoint_agent\edtmrs_agent.exe" -ForegroundColor Green
-    } elseif (Test-Path "$buildDir\edtmrs_agent.exe") {
-        Copy-Item "$buildDir\edtmrs_agent.exe" "$agentDir\edtmrs_agent.exe" -Force
+    if (Test-Path "$agentDir\edtmrs_agent.exe") {
         Write-Host "  ✅ Built: endpoint_agent\edtmrs_agent.exe" -ForegroundColor Green
     } else {
-        Write-Host "  ⚠ Build may have succeeded — check $buildDir" -ForegroundColor Yellow
+        Write-Host "  ❌ Build failed!" -ForegroundColor Red
+    }
+} elseif ($hasMSVC) {
+    # ── Build with MSVC ───────────────────────────────────────────────────────
+    Write-Host "[3/3] Building with MSVC..." -ForegroundColor Yellow
+    Set-Location $agentDir
+
+    # Use cl.exe directly (no CMake needed)
+    $clPath = "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvarsall.bat"
+    & $clPath amd64
+    cl.exe /EHsc /O2 /std:c++17 main.cpp device_monitor.cpp http_client.cpp /link winhttp.lib setupapi.lib cfgmgr32.lib ws2_32.lib /OUT:edtmrs_agent.exe
+
+    if (Test-Path "$agentDir\edtmrs_agent.exe") {
+        Write-Host "  ✅ Built: endpoint_agent\edtmrs_agent.exe" -ForegroundColor Green
+    } else {
+        Write-Host "  ❌ Build failed!" -ForegroundColor Red
     }
 } else {
-    Write-Host "  ⚠ CMake or compiler not found." -ForegroundColor Yellow
-    Write-Host "  Manual build options:" -ForegroundColor White
+    Write-Host "  ⚠ No compiler found." -ForegroundColor Yellow
+    Write-Host "  Install options:" -ForegroundColor White
     Write-Host ""
-    Write-Host "  OPTION A — Visual Studio (recommended):" -ForegroundColor Cyan
-    Write-Host "    1. Install Visual Studio 2022 Community (free)" -ForegroundColor White
-    Write-Host "       https://visualstudio.microsoft.com/" -ForegroundColor DarkGray
-    Write-Host "    2. Install 'Desktop development with C++' workload" -ForegroundColor White
-    Write-Host "    3. Install CMake from https://cmake.org" -ForegroundColor White
-    Write-Host "    4. Re-run this script" -ForegroundColor White
+    Write-Host "  OPTION A — Visual Studio 2022 (recommended):" -ForegroundColor Cyan
+    Write-Host "    https://visualstudio.microsoft.com/" -ForegroundColor DarkGray
+    Write-Host "    Install 'Desktop development with C++' workload" -ForegroundColor White
     Write-Host ""
-    Write-Host "  OPTION B — MinGW (lightweight, no Visual Studio):" -ForegroundColor Cyan
-    Write-Host "    1. Download w64devkit: https://github.com/skeeto/w64devkit/releases" -ForegroundColor White
-    Write-Host "    2. Extract and add its bin\ folder to PATH" -ForegroundColor White
-    Write-Host "    3. Run manual compile command below" -ForegroundColor White
+    Write-Host "  OPTION B — MinGW/w64devkit (lightweight):" -ForegroundColor Cyan
+    Write-Host "    https://github.com/skeeto/w64devkit/releases" -ForegroundColor DarkGray
+    Write-Host "    Extract and add bin\ to PATH" -ForegroundColor White
     Write-Host ""
-    Write-Host "  OPTION C — Manual MinGW compile:" -ForegroundColor Cyan
+    Write-Host "  OPTION C — Manual MinGW compile after installing:" -ForegroundColor Cyan
     Write-Host "    cd endpoint_agent" -ForegroundColor White
     Write-Host '    g++ -std=c++17 -O2 -o edtmrs_agent.exe main.cpp device_monitor.cpp http_client.cpp -lwinhttp -lsetupapi -lcfgmgr32 -lws2_32' -ForegroundColor White
     Write-Host ""

@@ -1,89 +1,54 @@
-"""
-EDTMRS - WebSocket Manager
-Real-time alert broadcasting to connected admin dashboards
-"""
-
-import json
-import logging
+import json, logging
 from typing import List
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
-logger = logging.getLogger(__name__)
-
+logger    = logging.getLogger(__name__)
 ws_router = APIRouter()
-
 
 class ConnectionManager:
     def __init__(self):
-        self.active_connections: List[WebSocket] = []
+        self.connections: List[WebSocket] = []
 
-    async def connect(self, websocket: WebSocket):
-        await websocket.accept()
-        self.active_connections.append(websocket)
-        logger.info(f"WebSocket client connected. Total: {len(self.active_connections)}")
+    async def connect(self, ws: WebSocket):
+        await ws.accept()
+        self.connections.append(ws)
+        logger.info(f"WS client connected. Total={len(self.connections)}")
 
-    def disconnect(self, websocket: WebSocket):
-        if websocket in self.active_connections:
-            self.active_connections.remove(websocket)
-        logger.info(f"WebSocket client disconnected. Total: {len(self.active_connections)}")
+    def disconnect(self, ws: WebSocket):
+        if ws in self.connections:
+            self.connections.remove(ws)
+        logger.info(f"WS client disconnected. Total={len(self.connections)}")
 
-    async def broadcast(self, message: dict):
-        """Send message to ALL connected admin dashboards."""
-        if not self.active_connections:
+    async def broadcast(self, msg: dict):
+        if not self.connections:
             return
-        text = json.dumps(message)
+        text = json.dumps(msg)
         dead = []
-        for connection in self.active_connections:
-            try:
-                await connection.send_text(text)
-            except Exception:
-                dead.append(connection)
-        for conn in dead:
-            self.disconnect(conn)
+        for ws in self.connections:
+            try:    await ws.send_text(text)
+            except: dead.append(ws)
+        for ws in dead:
+            self.disconnect(ws)
 
-    async def send_alert(self, alert_data: dict):
-        """Send a device alert event."""
-        await self.broadcast({
-            "type": "device_alert",
-            "data": alert_data
-        })
+    async def send_device_event(self, data: dict):
+        await self.broadcast({"type": "device_event", "data": data})
 
-    async def send_device_event(self, event_data: dict):
-        """Send a device connected event."""
-        await self.broadcast({
-            "type": "device_event",
-            "data": event_data
-        })
+    async def send_alert(self, data: dict):
+        await self.broadcast({"type": "device_alert", "data": data})
 
-    async def send_endpoint_update(self, endpoint_data: dict):
-        """Send endpoint status update."""
-        await self.broadcast({
-            "type": "endpoint_update",
-            "data": endpoint_data
-        })
-
-
-# Global manager instance
 manager = ConnectionManager()
 
-
 @ws_router.websocket("/ws/alerts")
-async def websocket_alerts(websocket: WebSocket):
-    """WebSocket endpoint for real-time admin alerts."""
-    await manager.connect(websocket)
+async def ws_endpoint(ws: WebSocket):
+    await manager.connect(ws)
     try:
-        # Send welcome message
-        await websocket.send_text(json.dumps({
-            "type": "connected",
-            "message": "EDTMRS WebSocket connected. Listening for alerts..."
-        }))
-        # Keep connection alive, listen for pings
+        await ws.send_text(json.dumps({"type": "connected", "message": "EDTMRS connected"}))
         while True:
-            data = await websocket.receive_text()
+            data = await ws.receive_text()
             if data == "ping":
-                await websocket.send_text(json.dumps({"type": "pong"}))
+                await ws.send_text(json.dumps({"type": "pong"}))
     except WebSocketDisconnect:
-        manager.disconnect(websocket)
+        manager.disconnect(ws)
     except Exception as e:
-        logger.error(f"WebSocket error: {e}")
-        manager.disconnect(websocket)
+        logger.error(f"WS error: {e}")
+        manager.disconnect(ws)

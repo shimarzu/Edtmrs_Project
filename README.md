@@ -1,307 +1,232 @@
 # EDTMRS — External Device Threat Monitoring and Response System
-### SLIIT Cybersecurity Project | Shimar Z.A.M. (IT23215092) & Kavindya R.M.D. (IT23429246)
+
+![Version](https://img.shields.io/badge/version-6.1.0-blue)
+![Python](https://img.shields.io/badge/python-3.11+-green)
+![React](https://img.shields.io/badge/react-18-blue)
+![Platform](https://img.shields.io/badge/agent-Windows%2010%2F11-lightgrey)
+![License](https://img.shields.io/badge/license-MIT-green)
+
+> **SLIIT Information Security Project (IE3092)**
+> Shimar Z.A.M — IT23215092 | Kavindya R.M.D — IT23429246
+> Supervisor: Mr. Tharaniyawarma Kumaralingam
 
 ---
 
-## System Architecture
+## What is EDTMRS?
 
-```
-User PC (Endpoint Agent C++)
-         │  HTTP POST /api/device-event
-         ▼
-Admin PC (FastAPI Server :8000)
-         │
-         ├── SQLite Database (edtmrs.db)
-         │
-         └── WebSocket /ws/alerts
-                  │
-                  ▼
-         React Dashboard (:3000)  ← Real-time alert popups
-```
+EDTMRS is a lightweight, real-time USB endpoint security platform. It monitors every USB storage device inserted into monitored workstations across an organization, classifies the threat level, sends instant alerts to a web dashboard, and allows administrators to physically block or whitelist devices — all from a single admin panel.
 
 ---
 
-## File Structure
+## How It Works
 
 ```
-edtmrs/
-├── admin_server/
-│   ├── main.py              ← FastAPI app entry point
-│   ├── database.py          ← SQLite async DB + schema init
-│   ├── auth.py              ← JWT + bcrypt authentication
-│   ├── models.py            ← Pydantic request/response models
-│   ├── api_routes.py        ← All REST API endpoints
-│   ├── websocket_manager.py ← WebSocket real-time broadcasts
-│   └── requirements.txt     ← Python dependencies
-│
-├── dashboard/
-│   ├── public/index.html
-│   ├── src/
-│   │   ├── App.js           ← Root router + WebSocket listener
-│   │   ├── index.js         ← React entry point
-│   │   ├── index.css        ← Tailwind CSS
-│   │   ├── hooks/
-│   │   │   ├── useAuth.js   ← Auth context (login/logout/JWT)
-│   │   │   └── useWebSocket.js ← Auto-reconnect WS hook
-│   │   ├── utils/
-│   │   │   └── api.js       ← Axios API client (all endpoints)
-│   │   ├── components/
-│   │   │   ├── Sidebar.jsx  ← Navigation sidebar
-│   │   │   ├── RiskBadge.jsx ← Color-coded risk level badge
-│   │   │   └── AlertPopup.jsx ← Real-time toast notifications
-│   │   └── pages/
-│   │       ├── LoginPage.jsx    ← Admin authentication
-│   │       ├── DashboardPage.jsx ← Stats + charts + live feed
-│   │       ├── DevicesPage.jsx  ← Device table + block/whitelist
-│   │       ├── EndpointsPage.jsx ← User PCs + isolate action
-│   │       ├── AlertsPage.jsx   ← Alert management
-│   │       └── PolicyPage.jsx   ← Whitelist/blocklist manager
-│   ├── package.json
-│   └── tailwind.config.js
-│
-├── endpoint_agent/
-│   ├── main.cpp             ← Entry point, service support
-│   ├── device_monitor.cpp   ← WM_DEVICECHANGE + SetupAPI
+User PC 1 ──┐
+User PC 2 ──┼──→ Admin Server (FastAPI) ──→ React Dashboard
+User PC N ──┘         ↑                          ↑
+                 All USB events            Real-time alerts
+                 reported here             Block / Whitelist
+```
+
+1. USB inserted on any User PC
+2. C++ Agent detects it within 1 second, scans files for malware
+3. Event sent to Admin Server via HTTP POST
+4. Server classifies risk: **SAFE / MEDIUM / HIGH / CRITICAL**
+5. Dashboard receives WebSocket notification — popup appears instantly
+6. Admin clicks **BLOCK** → USB physically disabled on User PC within 5 seconds
+7. Admin clicks **WHITELIST** → USB re-enabled and marked as trusted
+
+---
+
+## Risk Levels
+
+| Level | Meaning |
+|-------|---------|
+| 🟢 SAFE | Admin whitelisted — no alert |
+| 🟡 MEDIUM | Normal new USB — review recommended |
+| 🟠 HIGH | Unknown/unidentifiable device |
+| 🔴 CRITICAL | Blocked by admin OR malicious files found (autorun.inf, .exe, .bat etc) |
+
+---
+
+## Project Structure
+
+```
+edtmrs_v2/
+├── admin_server/          ← Python FastAPI backend
+│   ├── main.py            ← Server entry point
+│   ├── api_routes.py      ← All REST API endpoints
+│   ├── auth.py            ← JWT authentication
+│   ├── database.py        ← SQLite schema + migrations
+│   ├── models.py          ← Pydantic request/response models
+│   ├── websocket_manager.py ← Real-time WebSocket broadcaster
+│   ├── test_server.py     ← Diagnostic test script
+│   ├── requirements.txt
+│   ├── START_ADMIN_SERVER.bat
+│   └── OPEN_FIREWALL.bat
+├── endpoint_agent/        ← C++ Windows agent
+│   ├── main.cpp           ← Agent entry point + Windows service
+│   ├── device_monitor.cpp ← USB drive polling (1s interval)
 │   ├── device_monitor.h
-│   ├── http_client.cpp      ← WinHTTP POST requests
+│   ├── http_client.cpp    ← WinHTTP POST + GET
 │   ├── http_client.h
-│   ├── CMakeLists.txt       ← Build configuration
-│   └── config.ini           ← SERVER_HOST, SERVER_PORT
-│
-├── database/
-│   └── schema.sql           ← Reference SQL schema
-│
-└── scripts/
-    ├── setup_admin.ps1      ← Admin PC automated setup
-    ├── build_agent.ps1      ← User PC build helper
-    └── start_server.py      ← Cross-platform server launcher
+│   ├── blocker.cpp        ← PowerShell USB block/unblock
+│   ├── blocker.h
+│   ├── config.ini         ← SERVER_HOST configuration
+│   ├── compile_and_install.bat
+│   ├── SETUP_USER_PC.bat  ← One-click user PC setup
+│   └── UNINSTALL.bat
+└── dashboard/             ← React 18 web dashboard
+    ├── src/
+    │   ├── App.js
+    │   ├── pages/         ← Login, Dashboard, Devices, Endpoints, Alerts, Policy
+    │   ├── components/    ← Sidebar, AlertPopup, RiskBadge
+    │   ├── hooks/         ← useAuth, useWebSocket
+    │   └── utils/api.js   ← All API calls
+    ├── .env               ← REACT_APP_API_URL config
+    ├── package.json
+    └── START_DASHBOARD.bat
 ```
 
 ---
 
-## ADMIN PC — Setup & Run
+## Quick Start
 
-### Prerequisites
-- Python 3.11+  →  https://python.org
-- Node.js 18+   →  https://nodejs.org
-- Both PCs on same LAN (or use one machine for testing)
+### Admin PC
 
-### Step 1 — Install backend dependencies
 ```powershell
-cd edtmrs\admin_server
+# 1. Open firewall (run once as Admin)
+OPEN_FIREWALL.bat
+
+# 2. Install dependencies
+cd admin_server
 pip install -r requirements.txt
-```
 
-### Step 2 — Start the FastAPI server
-```powershell
+# 3. Start server
 python main.py
-```
-The server starts on `http://0.0.0.0:8000`.
-The SQLite database `edtmrs.db` is auto-created on first run.
-Default admin account is created: **admin / Admin@1234**
 
-### Step 3 — Find your Admin PC's IP address
-```powershell
-ipconfig
-# Look for IPv4 Address under your LAN adapter
-# Example: 192.168.1.20
-```
-
-### Step 4 — Configure the React dashboard
-```powershell
-cd edtmrs\dashboard
-```
-Create a file `.env` with:
-```
-REACT_APP_API_URL=http://192.168.1.20:8000
-```
-Replace `192.168.1.20` with your actual Admin PC IP.
-
-### Step 5 — Install and start the dashboard
-```powershell
+# 4. Start dashboard (new terminal)
+cd dashboard
 npm install
 npm start
 ```
-Dashboard opens at: **http://localhost:3000**
 
----
+Open browser → `http://localhost:3000` → Login: `admin` / `Admin@1234`
 
-## USER PC — Build & Run Agent
+### User PC (repeat for each PC)
 
-### Prerequisites
-Choose ONE compiler option:
-
-**Option A — Visual Studio 2022 (recommended)**
-1. Download: https://visualstudio.microsoft.com/
-2. Install workload: **"Desktop development with C++"**
-3. Download CMake: https://cmake.org/download/
-
-**Option B — w64devkit (no Visual Studio needed)**
-1. Download: https://github.com/skeeto/w64devkit/releases
-2. Extract, add `bin\` to Windows PATH
-3. No CMake needed — use manual compile below
-
----
-
-### Step 1 — Edit config.ini
-Open `endpoint_agent\config.ini` and set your Admin PC's IP:
-```ini
-SERVER_HOST=192.168.1.20
-SERVER_PORT=8000
-HEARTBEAT_INTERVAL=30
-```
-
-### Step 2 — Compile the agent
-
-**With CMake (Option A):**
 ```powershell
-cd edtmrs\endpoint_agent
-mkdir build
-cd build
-cmake .. -DCMAKE_BUILD_TYPE=Release
-cmake --build . --config Release
-# Output: build\Release\edtmrs_agent.exe
-```
+# 1. Copy endpoint_agent folder to User PC
 
-**With MinGW/w64devkit (Option B):**
-```powershell
-cd edtmrs\endpoint_agent
-g++ -std=c++17 -O2 -o edtmrs_agent.exe main.cpp device_monitor.cpp http_client.cpp -lwinhttp -lsetupapi -lcfgmgr32 -lws2_32
-```
+# 2. Edit config.ini - set Admin PC IP
+SERVER_HOST=192.168.1.10   ← your Admin PC IP
 
-### Step 3 — Run the agent
+# 3. Compile agent (requires w64devkit)
+g++ -std=c++17 -O2 -o edtmrs_agent.exe ^
+    main.cpp device_monitor.cpp http_client.cpp blocker.cpp ^
+    -lwinhttp -lsetupapi -lcfgmgr32 -lws2_32
 
-**A) Console mode (recommended for testing — you see output):**
-```powershell
-.\edtmrs_agent.exe
-```
-
-**B) Install as a Windows background service:**
-```powershell
-# Run as Administrator
-.\edtmrs_agent.exe --install-service
-net start EDTMRSAgent
-```
-
-**C) Remove the service:**
-```powershell
-net stop EDTMRSAgent
-.\edtmrs_agent.exe --remove-service
+# 4. Install as service (right-click → Run as Administrator)
+SETUP_USER_PC.bat
 ```
 
 ---
 
-## Two-Machine Network Test
+## Testing
 
-```
-User PC  : 192.168.1.10  (runs edtmrs_agent.exe)
-Admin PC : 192.168.1.20  (runs FastAPI + React)
-```
-
-1. Start FastAPI on Admin PC → `python main.py`
-2. Start React on Admin PC → `npm start`
-3. Open browser: `http://localhost:3000` → login with admin/Admin@1234
-4. On User PC, set `SERVER_HOST=192.168.1.20` in config.ini
-5. Run `edtmrs_agent.exe` on User PC
-6. **Insert a USB drive** into the User PC
-7. Watch the Admin dashboard:
-   - Popup alert appears in bottom-right
-   - Device Monitor table updates
-   - Alerts page shows new entry
-   - Dashboard stats update
-
-**Firewall note:** Allow port 8000 TCP on Admin PC:
+### Verify server works
 ```powershell
-netsh advfirewall firewall add rule name="EDTMRS" dir=in action=allow protocol=TCP localport=8000
+cd admin_server
+python test_server.py
 ```
+All 9 tests should show ✅ PASS.
+
+### Test malicious file detection (safe — empty files)
+```powershell
+echo test > D:\autorun.inf
+echo test > D:\virus.exe
+echo test > D:\run.bat
+```
+Eject and reinsert → dashboard shows 🔴 CRITICAL
 
 ---
 
-## API Reference
+## API Endpoints
 
-| Method | Endpoint                   | Description                        |
-|--------|----------------------------|------------------------------------|
-| POST   | /api/auth/login            | Login, get JWT token               |
-| GET    | /api/auth/me               | Current user info                  |
-| POST   | /api/device-event          | Receive event from agent (no auth) |
-| POST   | /api/heartbeat             | Agent keepalive (no auth)          |
-| GET    | /api/stats                 | Dashboard statistics               |
-| GET    | /api/devices               | List all device logs               |
-| GET    | /api/endpoints             | List all registered endpoints      |
-| GET    | /api/alerts                | List alerts                        |
-| POST   | /api/alerts/acknowledge    | Acknowledge single alert           |
-| POST   | /api/alerts/acknowledge-all| Acknowledge all alerts             |
-| POST   | /api/block-device          | Block a device by VID/PID/serial   |
-| POST   | /api/whitelist-device      | Whitelist a device                 |
-| GET    | /api/whitelist             | List whitelisted devices           |
-| GET    | /api/blocked-devices       | List blocked devices               |
-| DELETE | /api/whitelist/{id}        | Remove from whitelist              |
-| DELETE | /api/blocked-devices/{id}  | Unblock a device                   |
-| POST   | /api/isolate-endpoint      | Isolate an endpoint                |
-| POST   | /api/unisolate-endpoint/{id}| Unisolate an endpoint             |
-| WS     | /ws/alerts                 | WebSocket real-time event stream   |
-
-Interactive API docs: **http://localhost:8000/docs**
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST | `/api/auth/login` | Admin login → returns JWT token |
+| POST | `/api/device-event` | Agent reports USB insertion |
+| POST | `/api/heartbeat` | Agent keepalive |
+| GET | `/api/pending-actions/{hostname}` | Agent polls for block commands |
+| GET | `/api/devices` | List all device records |
+| GET | `/api/endpoints` | List all monitored endpoints |
+| GET | `/api/alerts` | List all threat alerts |
+| POST | `/api/block-device` | Block a device (queues command to agent) |
+| POST | `/api/whitelist-device` | Whitelist a device |
+| POST | `/api/alerts/acknowledge` | Acknowledge an alert |
+| GET | `/api/export/devices` | Export device logs as CSV |
+| GET | `/api/export/alerts` | Export alerts as CSV |
+| WS | `/ws/alerts` | WebSocket real-time events |
 
 ---
 
-## Risk Classification Logic
+## Tech Stack
 
-| Condition                              | Risk Level |
-|----------------------------------------|------------|
-| Device found in whitelist              | ✅ SAFE    |
-| Device found in blocked list           | 🔴 CRITICAL|
-| Serial number is "unknown" or empty    | 🟠 HIGH    |
-| Vendor ID is "unknown" or empty        | 🟡 MEDIUM  |
-| Known VID/PID/serial, not whitelisted  | 🟡 MEDIUM  |
-
----
-
-## Database Tables
-
-| Table            | Purpose                                        |
-|------------------|------------------------------------------------|
-| users            | Admin accounts with bcrypt hashed passwords   |
-| endpoints        | Registered User PCs + online/offline status   |
-| device_logs      | Every USB insertion event with metadata       |
-| alerts           | Generated alerts with severity levels         |
-| device_whitelist | Approved devices (no alerts generated)        |
-| blocked_devices  | Banned devices (marked CRITICAL)              |
+| Component | Technology |
+|-----------|-----------|
+| Endpoint Agent | C++17, WinHTTP, SetupAPI, PowerShell PnP |
+| Backend | Python 3.11, FastAPI, SQLite (aiosqlite) |
+| Authentication | JWT (PyJWT), bcrypt |
+| Real-Time | WebSocket (FastAPI native) |
+| Frontend | React 18, Chart.js, Axios |
+| USB Blocking | PowerShell `Disable-PnpDevice` / `Enable-PnpDevice` |
 
 ---
 
-## Security Features
+## Requirements
 
-- **JWT Authentication** — all API endpoints protected (except device-event/heartbeat)
-- **bcrypt password hashing** — industry-standard, cost factor 12
-- **Role-based access** — superadmin, admin roles
-- **Input validation** — Pydantic models on all endpoints
-- **CORS** — configurable origins (currently open for development)
+**Admin PC:** Python 3.11+, Node.js 18+, any OS
+
+**User PC:** Windows 10/11 (64-bit), w64devkit (MinGW) for compilation, Administrator privileges
 
 ---
 
 ## Default Credentials
+
 ```
-Username : admin
-Password : Admin@1234
+Username: admin
+Password: Admin@1234
 ```
-**Change this immediately in production!**
+
+Change after first login in production.
 
 ---
 
-## Technology Stack
+## Troubleshooting
 
-| Layer           | Technology                        |
-|-----------------|-----------------------------------|
-| Endpoint Agent  | C++17, WinHTTP, SetupAPI, WinAPI  |
-| Backend API     | Python 3.11, FastAPI, aiosqlite   |
-| Database        | SQLite (via aiosqlite)            |
-| Authentication  | JWT (PyJWT), bcrypt               |
-| Real-time       | WebSockets (FastAPI native)       |
-| Frontend        | React 18, TailwindCSS, Chart.js   |
-| HTTP Client     | WinHTTP (built-in Windows)        |
+**USB not showing on dashboard**
+- Check agent log: `type C:\edtmrs\endpoint_agent\edtmrs_agent.log`
+- Verify `SERVER_HOST` in `config.ini` matches Admin PC IP
+- Run `OPEN_FIREWALL.bat` on Admin PC as Administrator
+
+**Login fails**
+- Ensure `python main.py` is running
+- Delete `edtmrs.db` and restart server for fresh credentials
+
+**Block not working**
+- Agent must run as Administrator (service runs as SYSTEM ✅)
+- Check agent log for `BLOCKED_OK`
+
+**npm start fails**
+```powershell
+rmdir /s /q node_modules && del package-lock.json
+npm install && npm start
+```
+> ⚠️ Never run `npm audit fix --force`
 
 ---
 
-*SLIIT — Department of Computer System Engineering*
-*B.Sc. (Hons) IT, Specialization in Cyber Security — 2026*
+## License
+
+MIT License — see LICENSE file for details.

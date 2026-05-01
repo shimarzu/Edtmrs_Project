@@ -1,143 +1,86 @@
-// EDTMRS v2.0 - HTTP Client Implementation
-// Uses WinHTTP - built into Windows, no extra installs needed
-// KEY FIX: Correct wide-string length (wlen-1 strips null terminator)
-// KEY FIX: Added connection timeout so agent doesn't hang if server is down
-
+// EDTMRS v6.1 - HTTP Client using WinHTTP
 #include "http_client.h"
+#include "device_monitor.h"   // for EDTMRS_VERSION
 #include <windows.h>
 #include <winhttp.h>
-#include <iostream>
-
-#pragma comment(lib, "winhttp.lib")
 
 HttpClient::HttpClient(const std::string& host, int port)
     : m_host(host), m_port(port) {}
-
 HttpClient::~HttpClient() {}
 
-// Convert std::string to std::wstring (strips null terminator correctly)
 static std::wstring toWide(const std::string& s) {
     if (s.empty()) return L"";
     int len = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, nullptr, 0);
     if (len <= 0) return L"";
-    std::wstring result(len - 1, L'\0');   // len-1 to exclude null terminator
-    MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, &result[0], len);
-    return result;
+    std::wstring r(len-1, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, &r[0], len);
+    return r;
 }
 
-HttpResponse HttpClient::post(const std::string& path, const std::string& jsonBody) {
-    HttpResponse result = { 0, "", false };
-
-    std::wstring wHost = toWide(m_host);
-    std::wstring wPath = toWide(path);
-
-    // ── Open session ──────────────────────────────────────────────────────────
-    HINTERNET hSession = WinHttpOpen(
-        L"EDTMRS-Agent/2.0",
+static HttpResponse doRequest(const std::string& host, int port,
+                               const std::string& method,
+                               const std::string& path,
+                               const std::string& body = "") {
+    HttpResponse result;
+    HINTERNET hSess = WinHttpOpen(L"EDTMRS-Agent/6.1",
         WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
-        WINHTTP_NO_PROXY_NAME,
-        WINHTTP_NO_PROXY_BYPASS,
-        0
-    );
-    if (!hSession) {
-        std::cerr << "[EDTMRS] WinHttpOpen failed: " << GetLastError() << std::endl;
-        return result;
-    }
+        WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!hSess) return result;
+    WinHttpSetTimeouts(hSess, 5000, 5000, 10000, 10000);
 
-    // Set timeouts: resolve=5s, connect=5s, send=10s, receive=10s
-    WinHttpSetTimeouts(hSession, 5000, 5000, 10000, 10000);
+    HINTERNET hConn = WinHttpConnect(hSess, toWide(host).c_str(), (INTERNET_PORT)port, 0);
+    if (!hConn) { WinHttpCloseHandle(hSess); return result; }
 
-    // ── Connect ───────────────────────────────────────────────────────────────
-    HINTERNET hConnect = WinHttpConnect(
-        hSession, wHost.c_str(), (INTERNET_PORT)m_port, 0);
-    if (!hConnect) {
-        std::cerr << "[EDTMRS] WinHttpConnect failed: " << GetLastError()
-                  << " (Is the server running at " << m_host << ":" << m_port << "?)" << std::endl;
-        WinHttpCloseHandle(hSession);
-        return result;
-    }
+    HINTERNET hReq = WinHttpOpenRequest(hConn, toWide(method).c_str(),
+        toWide(path).c_str(), nullptr, WINHTTP_NO_REFERER,
+        WINHTTP_DEFAULT_ACCEPT_TYPES, 0);
+    if (!hReq) { WinHttpCloseHandle(hConn); WinHttpCloseHandle(hSess); return result; }
 
-    // ── Open request (HTTP, not HTTPS) ────────────────────────────────────────
-    HINTERNET hRequest = WinHttpOpenRequest(
-        hConnect, L"POST", wPath.c_str(),
-        nullptr, WINHTTP_NO_REFERER,
-        WINHTTP_DEFAULT_ACCEPT_TYPES,
-        0   // 0 = HTTP,  WINHTTP_FLAG_SECURE = HTTPS
-    );
-    if (!hRequest) {
-        std::cerr << "[EDTMRS] WinHttpOpenRequest failed: " << GetLastError() << std::endl;
-        WinHttpCloseHandle(hConnect);
-        WinHttpCloseHandle(hSession);
-        return result;
-    }
+    if (!body.empty())
+        WinHttpAddRequestHeaders(hReq, L"Content-Type: application/json\r\n",
+            (DWORD)-1, WINHTTP_ADDREQ_FLAG_ADD);
 
-    // ── Set Content-Type header ───────────────────────────────────────────────
-    WinHttpAddRequestHeaders(
-        hRequest,
-        L"Content-Type: application/json\r\n",
-        (DWORD)-1,
-        WINHTTP_ADDREQ_FLAG_ADD
-    );
-
-    // ── Send request with JSON body ───────────────────────────────────────────
-    BOOL ok = WinHttpSendRequest(
-        hRequest,
+    BOOL ok = WinHttpSendRequest(hReq,
         WINHTTP_NO_ADDITIONAL_HEADERS, 0,
-        (LPVOID)jsonBody.c_str(),
-        (DWORD)jsonBody.size(),
-        (DWORD)jsonBody.size(),
-        0
-    );
-    if (!ok) {
-        std::cerr << "[EDTMRS] WinHttpSendRequest failed: " << GetLastError() << std::endl;
-        WinHttpCloseHandle(hRequest);
-        WinHttpCloseHandle(hConnect);
-        WinHttpCloseHandle(hSession);
-        return result;
+        body.empty() ? WINHTTP_NO_REQUEST_DATA : (LPVOID)body.c_str(),
+        (DWORD)body.size(), (DWORD)body.size(), 0);
+
+    if (ok) ok = WinHttpReceiveResponse(hReq, nullptr);
+
+    if (ok) {
+        DWORD sc = 0, sz = sizeof(sc);
+        WinHttpQueryHeaders(hReq,
+            WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+            WINHTTP_HEADER_NAME_BY_INDEX, &sc, &sz, WINHTTP_NO_HEADER_INDEX);
+        result.status_code = (int)sc;
+        result.success     = (sc >= 200 && sc < 300);
+        DWORD avail = 0, read = 0;
+        do {
+            if (!WinHttpQueryDataAvailable(hReq, &avail) || !avail) break;
+            char* buf = new char[avail+1];
+            memset(buf, 0, avail+1);
+            if (WinHttpReadData(hReq, buf, avail, &read))
+                result.body += std::string(buf, read);
+            delete[] buf;
+        } while (avail > 0);
     }
 
-    // ── Receive response ──────────────────────────────────────────────────────
-    ok = WinHttpReceiveResponse(hRequest, nullptr);
-    if (!ok) {
-        std::cerr << "[EDTMRS] WinHttpReceiveResponse failed: " << GetLastError() << std::endl;
-        WinHttpCloseHandle(hRequest);
-        WinHttpCloseHandle(hConnect);
-        WinHttpCloseHandle(hSession);
-        return result;
-    }
-
-    // ── Read HTTP status code ─────────────────────────────────────────────────
-    DWORD statusCode = 0;
-    DWORD statusSize = sizeof(statusCode);
-    WinHttpQueryHeaders(
-        hRequest,
-        WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
-        WINHTTP_HEADER_NAME_BY_INDEX,
-        &statusCode, &statusSize,
-        WINHTTP_NO_HEADER_INDEX
-    );
-    result.status_code = (int)statusCode;
-
-    // ── Read response body ────────────────────────────────────────────────────
-    DWORD dwSize = 0, dwRead = 0;
-    do {
-        if (!WinHttpQueryDataAvailable(hRequest, &dwSize) || dwSize == 0) break;
-        char* buf = new char[dwSize + 1];
-        memset(buf, 0, dwSize + 1);
-        if (WinHttpReadData(hRequest, buf, dwSize, &dwRead))
-            result.body += std::string(buf, dwRead);
-        delete[] buf;
-    } while (dwSize > 0);
-
-    result.success = (statusCode >= 200 && statusCode < 300);
-
-    WinHttpCloseHandle(hRequest);
-    WinHttpCloseHandle(hConnect);
-    WinHttpCloseHandle(hSession);
+    WinHttpCloseHandle(hReq);
+    WinHttpCloseHandle(hConn);
+    WinHttpCloseHandle(hSess);
     return result;
 }
 
+HttpResponse HttpClient::post(const std::string& path, const std::string& body) {
+    return doRequest(m_host, m_port, "POST", path, body);
+}
+HttpResponse HttpClient::get(const std::string& path) {
+    return doRequest(m_host, m_port, "GET", path);
+}
 HttpResponse HttpClient::heartbeat(const std::string& hostname) {
-    std::string json = "{\"hostname\":\"" + hostname + "\"}";
+    std::string json =
+        std::string("{\"hostname\":\"") + hostname +
+        "\",\"ip_address\":\"\",\"username\":\"\",\"agent_version\":\"" +
+        EDTMRS_VERSION + "\"}";
     return post("/api/heartbeat", json);
 }

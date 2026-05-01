@@ -1,86 +1,139 @@
-// EDTMRS v6.0 - Endpoint Agent Main
-// REAL USB BLOCKING: Uses devcon/pnputil + registry to physically
-// block/unblock specific USB devices by hardware ID
-// Requires: Agent running as Administrator (Windows Service mode does this)
+// EDTMRS v6.1 - Endpoint Agent
+// - Polls drives every 1 second for USB insertions
+// - Scans files for malware (autorun.inf, exe, bat, vbs etc)
+// - Sends telemetry to admin server via HTTP POST
+// - Polls server every 5s for block/unblock commands
+// - Runs as silent Windows Service (auto-start on boot)
+// - Writes log to edtmrs_agent.log
 
 #include <windows.h>
 #include <iostream>
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <vector>
+#include <algorithm>
 #include <thread>
 #include <chrono>
-#include <algorithm>
 
 #include "device_monitor.h"
 #include "http_client.h"
+#include "blocker.h"
 
-// ─── Config ───────────────────────────────────────────────────────────────────
+// ── Config ────────────────────────────────────────────────────────────────────
 static std::string SERVER_HOST            = "127.0.0.1";
 static int         SERVER_PORT            = 8000;
 static int         HEARTBEAT_INTERVAL_SEC = 30;
 
-// ─── Get exe directory ────────────────────────────────────────────────────────
+// ── Exe directory ─────────────────────────────────────────────────────────────
 static std::string getExeDir() {
     char path[MAX_PATH] = {};
     GetModuleFileNameA(nullptr, path, MAX_PATH);
     std::string full(path);
     size_t pos = full.rfind('\\');
-    return (pos != std::string::npos) ? full.substr(0, pos + 1) : "";
+    return (pos != std::string::npos) ? full.substr(0, pos+1) : "";
 }
 
-// ─── File logger ─────────────────────────────────────────────────────────────
+// ── Logger ────────────────────────────────────────────────────────────────────
 static void writeLog(const std::string& msg) {
     std::string logPath = getExeDir() + "edtmrs_agent.log";
-    std::ofstream log(logPath, std::ios::app);
-    if (log.is_open()) {
+    std::ofstream f(logPath, std::ios::app);
+    if (f.is_open()) {
         SYSTEMTIME st; GetLocalTime(&st);
         char ts[32];
         snprintf(ts, sizeof(ts), "%04d-%02d-%02d %02d:%02d:%02d",
             st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
-        log << "[" << ts << "] " << msg << "\n";
-        log.flush();
+        f << "[" << ts << "] " << msg << "\n";
+        f.flush();
     }
     std::cout << "[EDTMRS] " << msg << std::endl;
 }
 
-// ─── Load config ──────────────────────────────────────────────────────────────
+// ── Load config.ini ───────────────────────────────────────────────────────────
 static void loadConfig() {
     std::string configPath = getExeDir() + "config.ini";
     std::ifstream f(configPath);
     if (!f.is_open()) f.open("config.ini");
-    if (!f.is_open()) return;
+    if (!f.is_open()) { writeLog("config.ini not found, using defaults"); return; }
     std::string line;
     while (std::getline(f, line)) {
         if (line.empty() || line[0] == '#') continue;
         auto eq = line.find('=');
         if (eq == std::string::npos) continue;
-        std::string key = line.substr(0, eq), val = line.substr(eq + 1);
+        std::string key = line.substr(0, eq);
+        std::string val = line.substr(eq+1);
         auto trim = [](std::string& s) {
-            while (!s.empty() && (s.front()==' '||s.front()=='\t')) s.erase(s.begin());
+            while (!s.empty() && (s.front()==' '||s.front()=='\t'||s.front()=='\r')) s.erase(s.begin());
             while (!s.empty() && (s.back()==' '||s.back()=='\t'||s.back()=='\r'||s.back()=='\n')) s.pop_back();
         };
         trim(key); trim(val);
-        if      (key == "SERVER_HOST")        SERVER_HOST            = val;
-        else if (key == "SERVER_PORT")        SERVER_PORT            = std::stoi(val);
-        else if (key == "HEARTBEAT_INTERVAL") HEARTBEAT_INTERVAL_SEC = std::stoi(val);
+        if      (key=="SERVER_HOST")        SERVER_HOST = val;
+        else if (key=="SERVER_PORT")        SERVER_PORT = std::stoi(val);
+        else if (key=="HEARTBEAT_INTERVAL") HEARTBEAT_INTERVAL_SEC = std::stoi(val);
     }
-    writeLog("Config: SERVER=" + SERVER_HOST + ":" + std::to_string(SERVER_PORT));
+    writeLog("Config: " + SERVER_HOST + ":" + std::to_string(SERVER_PORT));
 }
 
-// ─── JSON builder ─────────────────────────────────────────────────────────────
-static std::string buildJson(const DeviceInfo& d) {
-    auto esc = [](const std::string& s) {
-        std::string o;
-        for (char c : s) {
-            if      (c=='"')  o += "\\\"";
-            else if (c=='\\') o += "\\\\";
-            else if (c=='\n') o += "\\n";
-            else if (c=='\r') o += "\\r";
-            else              o += c;
+// ── File scanner ──────────────────────────────────────────────────────────────
+static const std::vector<std::string> MALWARE_EXT = {
+    ".exe",".bat",".cmd",".scr",".pif",".com",".vbs",".vbe",
+    ".js",".jse",".wsf",".wsh",".ps1",".reg",".hta",".inf",".lnk"
+};
+
+static bool isMalicious(const std::string& name) {
+    std::string low = name;
+    std::transform(low.begin(), low.end(), low.begin(), ::tolower);
+    if (low == "autorun.inf") return true;
+    for (auto& ext : MALWARE_EXT)
+        if (low.size() >= ext.size() &&
+            low.substr(low.size()-ext.size()) == ext) return true;
+    return false;
+}
+
+static void scanDrive(const std::string& driveLetter,
+                      std::vector<std::string>& dangerous, int& total) {
+    dangerous.clear(); total = 0;
+    if (driveLetter.empty()) return;
+    std::string searchPath = driveLetter + "\\*";
+    WIN32_FIND_DATAA ffd;
+    HANDLE hFind = FindFirstFileA(searchPath.c_str(), &ffd);
+    if (hFind == INVALID_HANDLE_VALUE) return;
+    do {
+        std::string nm(ffd.cFileName);
+        if (nm == "." || nm == "..") continue;
+        if (!(ffd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
+            total++;
+            if (isMalicious(nm)) {
+                dangerous.push_back(nm);
+                writeLog("DANGEROUS FILE: " + nm);
+            }
         }
-        return o;
-    };
+    } while (FindNextFileA(hFind, &ffd));
+    FindClose(hFind);
+    writeLog("Scan done: " + std::to_string(total) + " files, " +
+             std::to_string(dangerous.size()) + " dangerous");
+}
+
+// ── JSON builder ──────────────────────────────────────────────────────────────
+static std::string esc(const std::string& s) {
+    std::string o;
+    for (char c : s) {
+        if      (c=='"')  o+="\\\"";
+        else if (c=='\\') o+="\\\\";
+        else if (c=='\n') o+="\\n";
+        else if (c=='\r') o+="\\r";
+        else              o+=c;
+    }
+    return o;
+}
+
+static std::string buildJson(const DeviceInfo& d) {
+    std::string arr = "[";
+    for (size_t i = 0; i < d.dangerous_files.size(); i++) {
+        if (i > 0) arr += ",";
+        arr += "\"" + esc(d.dangerous_files[i]) + "\"";
+    }
+    arr += "]";
     std::ostringstream j;
     j << "{"
       << "\"vendor_id\":\""     << esc(d.vendor_id)     << "\","
@@ -92,416 +145,225 @@ static std::string buildJson(const DeviceInfo& d) {
       << "\"hostname\":\""      << esc(d.hostname)      << "\","
       << "\"username\":\""      << esc(d.username)      << "\","
       << "\"timestamp\":\""     << esc(d.timestamp)     << "\","
-      << "\"agent_version\":\"" << esc(d.agent_version) << "\""
+      << "\"agent_version\":\"" << esc(d.agent_version) << "\","
+      << "\"dangerous_files\":" << arr                  << ","
+      << "\"file_count\":"      << d.file_count
       << "}";
     return j.str();
 }
 
-// ─── Parse JSON value ─────────────────────────────────────────────────────────
-// Extracts value of a key from a simple flat JSON string
-static std::string parseJsonValue(const std::string& json, const std::string& key) {
+// ── Parse string from simple JSON ────────────────────────────────────────────
+static std::string parseJsonStr(const std::string& json, const std::string& key) {
     std::string search = "\"" + key + "\":\"";
     size_t pos = json.find(search);
-    if (pos == std::string::npos) {
-        // Try without quotes for booleans/numbers
-        search = "\"" + key + "\":";
-        pos = json.find(search);
-        if (pos == std::string::npos) return "";
-        size_t start = pos + search.length();
-        size_t end   = json.find_first_of(",}", start);
-        return json.substr(start, end - start);
-    }
-    size_t start = pos + search.length();
+    if (pos == std::string::npos) return "";
+    size_t start = pos + search.size();
     size_t end   = json.find("\"", start);
-    return json.substr(start, end - start);
+    if (end == std::string::npos) return "";
+    return json.substr(start, end-start);
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-//  REAL USB BLOCKING FUNCTIONS
-//  Method: Use Windows built-in pnputil.exe to disable/enable devices by HwId
-//  This physically disables the device — Windows shows "Device is disabled"
-//  NO third-party tools needed. pnputil.exe ships with every Windows 7+
-// ═══════════════════════════════════════════════════════════════════════════════
-
-// Build Hardware ID string from VID+PID (format Windows uses)
-static std::string buildHwId(const std::string& vid, const std::string& pid) {
-    // Windows Hardware ID format: USB\VID_XXXX&PID_XXXX
-    std::string v = vid, p = pid;
-    std::transform(v.begin(), v.end(), v.begin(), ::toupper);
-    std::transform(p.begin(), p.end(), p.begin(), ::toupper);
-    return "USB\\VID_" + v + "&PID_" + p;
-}
-
-// Run a Windows command silently and return exit code
-static int runCommand(const std::string& cmd) {
-    writeLog("Running: " + cmd);
-    // Create a hidden process
-    STARTUPINFOA si = {};
-    si.cb          = sizeof(si);
-    si.dwFlags     = STARTF_USESHOWWINDOW;
-    si.wShowWindow = SW_HIDE;
-
-    PROCESS_INFORMATION pi = {};
-    std::string cmdCopy = cmd; // CreateProcessA needs non-const
-
-    BOOL ok = CreateProcessA(
-        nullptr,
-        &cmdCopy[0],
-        nullptr, nullptr,
-        FALSE,
-        CREATE_NO_WINDOW,
-        nullptr, nullptr,
-        &si, &pi
-    );
-
-    if (!ok) {
-        writeLog("CreateProcess failed: " + std::to_string(GetLastError()));
-        return -1;
-    }
-
-    // Wait up to 15 seconds for command to complete
-    WaitForSingleObject(pi.hProcess, 15000);
-    DWORD exitCode = 0;
-    GetExitCodeProcess(pi.hProcess, &exitCode);
-    CloseHandle(pi.hProcess);
-    CloseHandle(pi.hThread);
-
-    writeLog("Command exit code: " + std::to_string(exitCode));
-    return (int)exitCode;
-}
-
-// ── BLOCK a USB device physically ────────────────────────────────────────────
-// Uses pnputil to disable the device node matching VID+PID
-// After this, the USB drive becomes inaccessible (no drive letter assigned)
-static bool blockUsbDevice(const DeviceInfo& info) {
-    writeLog("=== BLOCKING DEVICE: " + info.device_name + " ===");
-    writeLog("VID: " + info.vendor_id + " PID: " + info.product_id);
-
-    if (info.vendor_id == "unknown" || info.vendor_id.empty()) {
-        writeLog("Cannot block: VID is unknown");
-        return false;
-    }
-
-    // Method 1: Use pnputil to disable all devices matching the hardware ID
-    // pnputil /disable-device "USB\VID_XXXX&PID_XXXX" /subtree
-    std::string hwId = buildHwId(info.vendor_id, info.product_id);
-    std::string cmd1 = "pnputil /disable-device \"" + hwId + "\" /subtree";
-    int result = runCommand(cmd1);
-
-    if (result == 0) {
-        writeLog("✅ Device BLOCKED via pnputil: " + hwId);
-
-        // Also write to registry for persistence across reboots
-        // Block this specific device class from being enabled
-        std::string regCmd =
-            "reg add \"HKLM\\SOFTWARE\\EDTMRS\\BlockedDevices\" "
-            "/v \"" + hwId + "\" /t REG_SZ /d \"blocked\" /f";
-        runCommand(regCmd);
-
-        return true;
-    }
-
-    // Method 2 fallback: Use devcon if available
-    std::string devconPath = getExeDir() + "devcon.exe";
-    std::ifstream devconCheck(devconPath);
-    if (devconCheck.good()) {
-        devconCheck.close();
-        std::string cmd2 = "\"" + devconPath + "\" disable \"" + hwId + "\"";
-        result = runCommand(cmd2);
-        if (result == 0) {
-            writeLog("✅ Device BLOCKED via devcon: " + hwId);
-            return true;
-        }
-    }
-
-    // Method 3 fallback: Disable via registry (USBSTOR device specific)
-    // This changes the device start type to 4 (disabled) for this specific device
-    // Find the device instance path in registry and disable it
-    writeLog("Attempting registry-based block...");
-
-    // Use PowerShell to disable the device
-    std::string psCmd =
-        "powershell -NonInteractive -WindowStyle Hidden -Command \""
-        "Get-PnpDevice | Where-Object { $_.HardwareID -like '*VID_" +
-        info.vendor_id + "*PID_" + info.product_id + "*' } | "
-        "Disable-PnpDevice -Confirm:$false\"";
-    result = runCommand(psCmd);
-
-    if (result == 0) {
-        writeLog("✅ Device BLOCKED via PowerShell PnP");
-        return true;
-    }
-
-    writeLog("❌ All block methods failed for " + hwId);
-    return false;
-}
-
-// ── UNBLOCK (whitelist) a USB device ─────────────────────────────────────────
-static bool unblockUsbDevice(const DeviceInfo& info) {
-    writeLog("=== UNBLOCKING DEVICE: " + info.device_name + " ===");
-
-    if (info.vendor_id == "unknown" || info.vendor_id.empty()) {
-        writeLog("Cannot unblock: VID is unknown");
-        return false;
-    }
-
-    std::string hwId = buildHwId(info.vendor_id, info.product_id);
-
-    // Method 1: pnputil enable
-    std::string cmd1 = "pnputil /enable-device \"" + hwId + "\" /subtree";
-    int result = runCommand(cmd1);
-
-    if (result == 0) {
-        writeLog("✅ Device UNBLOCKED via pnputil: " + hwId);
-
-        // Remove from registry block list
-        std::string regCmd =
-            "reg delete \"HKLM\\SOFTWARE\\EDTMRS\\BlockedDevices\" "
-            "/v \"" + hwId + "\" /f";
-        runCommand(regCmd);
-
-        return true;
-    }
-
-    // Method 2: devcon enable
-    std::string devconPath = getExeDir() + "devcon.exe";
-    std::ifstream devconCheck(devconPath);
-    if (devconCheck.good()) {
-        devconCheck.close();
-        std::string cmd2 = "\"" + devconPath + "\" enable \"" + hwId + "\"";
-        result = runCommand(cmd2);
-        if (result == 0) {
-            writeLog("✅ Device UNBLOCKED via devcon: " + hwId);
-            return true;
-        }
-    }
-
-    // Method 3: PowerShell enable
-    std::string psCmd =
-        "powershell -NonInteractive -WindowStyle Hidden -Command \""
-        "Get-PnpDevice | Where-Object { $_.HardwareID -like '*VID_" +
-        info.vendor_id + "*PID_" + info.product_id + "*' } | "
-        "Enable-PnpDevice -Confirm:$false\"";
-    result = runCommand(psCmd);
-
-    if (result == 0) {
-        writeLog("✅ Device UNBLOCKED via PowerShell PnP");
-        return true;
-    }
-
-    writeLog("❌ All unblock methods failed for " + hwId);
-    return false;
-}
-
-// ── Check startup registry and block any previously blocked devices ───────────
-static void enforceBlockedDevicesOnStartup() {
-    writeLog("Checking for previously blocked devices to enforce...");
-
-    // Read from registry
-    HKEY hKey;
-    if (RegOpenKeyExA(HKEY_LOCAL_MACHINE,
-        "SOFTWARE\\EDTMRS\\BlockedDevices", 0, KEY_READ, &hKey) != ERROR_SUCCESS) {
-        writeLog("No blocked devices registry key found.");
-        return;
-    }
-
-    char valueName[512];
-    DWORD nameLen = sizeof(valueName);
-    DWORD index   = 0;
-
-    while (RegEnumValueA(hKey, index, valueName, &nameLen,
-        nullptr, nullptr, nullptr, nullptr) == ERROR_SUCCESS) {
-
-        std::string hwId(valueName);
-        writeLog("Re-applying block for: " + hwId);
-
-        std::string cmd = "pnputil /disable-device \"" + hwId + "\" /subtree";
-        runCommand(cmd);
-
-        nameLen = sizeof(valueName);
-        index++;
-    }
-
-    RegCloseKey(hKey);
-    writeLog("Startup enforcement done.");
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-//  DEVICE EVENT HANDLER — reads server response and acts on it
-// ═══════════════════════════════════════════════════════════════════════════════
-
-static void onDeviceInserted(const DeviceInfo& info) {
+// ── Device inserted callback ──────────────────────────────────────────────────
+static void onDeviceInserted(const DeviceInfo& rawInfo) {
     writeLog("============================================");
-    writeLog("USB DEVICE DETECTED: " + info.device_name);
-    writeLog("  Drive  : " + info.drive_letter);
-    writeLog("  VID    : " + info.vendor_id);
-    writeLog("  PID    : " + info.product_id);
-    writeLog("  Serial : " + info.serial_number);
-    writeLog("  Host   : " + info.hostname);
-    writeLog("  User   : " + info.username);
+    writeLog("USB DETECTED: " + rawInfo.device_name);
+    writeLog("  VID=" + rawInfo.vendor_id + " PID=" + rawInfo.product_id);
+    writeLog("  Drive=" + rawInfo.drive_letter + " Serial=" + rawInfo.serial_number);
+    writeLog("  Host=" + rawInfo.hostname + " User=" + rawInfo.username);
 
+    // Scan drive for malware
+    DeviceInfo info = rawInfo;
+    if (!rawInfo.drive_letter.empty()) {
+        writeLog("Scanning " + rawInfo.drive_letter + " for malicious files...");
+        scanDrive(rawInfo.drive_letter, info.dangerous_files, info.file_count);
+        if (info.dangerous_files.empty())
+            writeLog("Clean (" + std::to_string(info.file_count) + " files scanned)");
+        else
+            writeLog("MALICIOUS FILES FOUND: " + std::to_string(info.dangerous_files.size()));
+    }
+
+    // Send to server
     HttpClient client(SERVER_HOST, SERVER_PORT);
     HttpResponse resp = client.post("/api/device-event", buildJson(info));
 
     if (!resp.success) {
-        writeLog("FAILED to send event [HTTP " + std::to_string(resp.status_code) + "]");
+        writeLog("Server unreachable [HTTP " + std::to_string(resp.status_code) + "]");
         writeLog("============================================");
         return;
     }
 
-    writeLog("Server responded [HTTP " + std::to_string(resp.status_code) + "]: " + resp.body);
+    writeLog("Server: " + resp.body);
+    std::string action    = parseJsonStr(resp.body, "action");
+    std::string risk      = parseJsonStr(resp.body, "risk_level");
+    writeLog("Risk=" + risk + " Action=" + action);
 
-    // ── Parse server response ────────────────────────────────────────────────
-    // Server returns: {"status":"ok","log_id":1,"risk_level":"critical","action":"block"}
-    std::string action     = parseJsonValue(resp.body, "action");
-    std::string risk_level = parseJsonValue(resp.body, "risk_level");
-
-    writeLog("Risk level : " + risk_level);
-    writeLog("Action     : " + (action.empty() ? "none" : action));
-
-    // ── Take action based on server instruction ──────────────────────────────
-    if (action == "block") {
-        writeLog(">>> SERVER SAYS: BLOCK THIS DEVICE <<<");
-        bool blocked = blockUsbDevice(info);
-        if (blocked) {
-            writeLog("✅ PHYSICAL BLOCK SUCCESSFUL — USB is now inaccessible");
-            // Notify server that block was executed
-            std::string notification =
-                "{\"log_id\":" + parseJsonValue(resp.body, "log_id") +
-                ",\"action_result\":\"blocked\",\"hostname\":\"" + info.hostname + "\"}";
-            client.post("/api/action-result", notification);
-        } else {
-            writeLog("❌ Physical block failed — check agent has Administrator rights");
-        }
-
-    } else if (action == "allow" || action == "whitelist") {
-        writeLog(">>> SERVER SAYS: ALLOW THIS DEVICE <<<");
-        bool unblocked = unblockUsbDevice(info);
-        if (unblocked) {
-            writeLog("✅ DEVICE UNBLOCKED — USB is now accessible");
-        }
-
-    } else if (risk_level == "critical") {
-        // Device is in blocked list but no explicit action sent
-        // Auto-block it
-        writeLog(">>> AUTO-BLOCK: Device is CRITICAL risk <<<");
-        blockUsbDevice(info);
-
-    } else {
-        writeLog("No block action required for this device.");
+    // Parse log_id
+    std::string log_id_str = "0";
+    size_t p = resp.body.find("\"log_id\":");
+    if (p != std::string::npos) {
+        size_t s = p+9, e = resp.body.find_first_of(",}", s);
+        log_id_str = resp.body.substr(s, e-s);
     }
 
+    if (action == "block" || risk == "critical") {
+        writeLog(">>> BLOCKING USB <<<");
+        bool ok = blockUsbDevice(info.vendor_id, info.product_id, info.device_name);
+        if (ok) {
+            writeLog("USB BLOCKED - device is now inaccessible");
+            std::string notify = "{\"log_id\":" + log_id_str +
+                ",\"action_result\":\"blocked\",\"hostname\":\"" + info.hostname + "\"}";
+            client.post("/api/action-result", notify);
+        } else {
+            writeLog("Block failed - run agent as Administrator!");
+        }
+    } else if (action == "allow") {
+        writeLog(">>> UNBLOCKING USB <<<");
+        if (unblockUsbDevice(info.vendor_id, info.product_id, info.device_name))
+            writeLog("USB UNBLOCKED");
+    }
     writeLog("============================================");
 }
 
-// ─── Heartbeat ────────────────────────────────────────────────────────────────
-static void heartbeatLoop() {
-    std::string hostname = DeviceMonitor::getHostname();
-    HttpClient  client(SERVER_HOST, SERVER_PORT);
-    std::this_thread::sleep_for(std::chrono::seconds(5));
-    while (true) {
-        HttpResponse r = client.heartbeat(hostname);
-        if (!r.success)
-            writeLog("Heartbeat failed - server may be down");
-        std::this_thread::sleep_for(std::chrono::seconds(HEARTBEAT_INTERVAL_SEC));
+// ── Heartbeat + poll pending actions ─────────────────────────────────────────
+static void pollPendingActions(const std::string& hostname) {
+    HttpClient client(SERVER_HOST, SERVER_PORT);
+    HttpResponse resp = client.get("/api/pending-actions/" + hostname);
+    if (!resp.success) return;
+
+    std::string body = resp.body;
+    size_t start = body.find('[');
+    size_t end   = body.rfind(']');
+    if (start == std::string::npos || end == std::string::npos) return;
+
+    size_t pos = start;
+    while (pos < end) {
+        size_t os = body.find('{', pos);
+        if (os == std::string::npos || os >= end) break;
+        size_t oe = body.find('}', os);
+        if (oe == std::string::npos) break;
+        std::string obj = body.substr(os, oe-os+1);
+
+        std::string action = parseJsonStr(obj, "action");
+        std::string vid    = parseJsonStr(obj, "vendor_id");
+        std::string pid    = parseJsonStr(obj, "product_id");
+        std::string name   = parseJsonStr(obj, "device_name");
+
+        if (!action.empty() && !vid.empty()) {
+            writeLog("PENDING ACTION: " + action + " VID=" + vid + " PID=" + pid);
+            if (action == "block")
+                blockUsbDevice(vid, pid, name.empty() ? "USB Device" : name);
+            else if (action == "allow")
+                unblockUsbDevice(vid, pid, name.empty() ? "USB Device" : name);
+        }
+        pos = oe+1;
     }
 }
 
-// ─── Windows Service ──────────────────────────────────────────────────────────
-static SERVICE_STATUS        g_svcStatus = {};
-static SERVICE_STATUS_HANDLE g_svcHandle = nullptr;
-static DeviceMonitor*        g_monitor   = nullptr;
+static void heartbeatLoop() {
+    std::string hostname = DeviceMonitor::getHostname();
+    std::this_thread::sleep_for(std::chrono::seconds(5));
+    while (true) {
+        HttpClient client(SERVER_HOST, SERVER_PORT);
+        client.heartbeat(hostname);
+        pollPendingActions(hostname);
+        std::this_thread::sleep_for(std::chrono::seconds(5));
+    }
+}
+
+// ── Windows Service ───────────────────────────────────────────────────────────
+static SERVICE_STATUS        g_status = {};
+static SERVICE_STATUS_HANDLE g_handle = nullptr;
+static DeviceMonitor*        g_mon    = nullptr;
 
 VOID WINAPI SvcCtrlHandler(DWORD ctrl) {
     if (ctrl == SERVICE_CONTROL_STOP || ctrl == SERVICE_CONTROL_SHUTDOWN) {
-        writeLog("Service stop requested");
-        g_svcStatus.dwCurrentState = SERVICE_STOP_PENDING;
-        SetServiceStatus(g_svcHandle, &g_svcStatus);
-        if (g_monitor) g_monitor->stop();
-        g_svcStatus.dwCurrentState = SERVICE_STOPPED;
-        SetServiceStatus(g_svcHandle, &g_svcStatus);
+        writeLog("Service stopping...");
+        g_status.dwCurrentState = SERVICE_STOP_PENDING;
+        SetServiceStatus(g_handle, &g_status);
+        if (g_mon) g_mon->stop();
+        g_status.dwCurrentState = SERVICE_STOPPED;
+        SetServiceStatus(g_handle, &g_status);
     }
 }
 
 VOID WINAPI SvcMain(DWORD, LPSTR*) {
-    g_svcHandle = RegisterServiceCtrlHandlerA("EDTMRSAgent", SvcCtrlHandler);
-    if (!g_svcHandle) return;
-
-    g_svcStatus.dwServiceType      = SERVICE_WIN32_OWN_PROCESS;
-    g_svcStatus.dwCurrentState     = SERVICE_START_PENDING;
-    g_svcStatus.dwControlsAccepted = 0;
-    SetServiceStatus(g_svcHandle, &g_svcStatus);
+    g_handle = RegisterServiceCtrlHandlerA("EDTMRSAgent", SvcCtrlHandler);
+    if (!g_handle) return;
+    g_status.dwServiceType      = SERVICE_WIN32_OWN_PROCESS;
+    g_status.dwCurrentState     = SERVICE_START_PENDING;
+    g_status.dwControlsAccepted = 0;
+    SetServiceStatus(g_handle, &g_status);
 
     loadConfig();
-    writeLog("=== EDTMRS Agent v" + std::string(EDTMRS_VERSION) + " Service Starting ===");
-
-    // Enforce any previously blocked devices on startup
+    writeLog("=== EDTMRS Agent v" EDTMRS_VERSION " Service Starting ===");
+    writeLog("Server: " + SERVER_HOST + ":" + std::to_string(SERVER_PORT));
     enforceBlockedDevicesOnStartup();
 
-    g_svcStatus.dwCurrentState     = SERVICE_RUNNING;
-    g_svcStatus.dwControlsAccepted = SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN;
-    SetServiceStatus(g_svcHandle, &g_svcStatus);
+    g_status.dwCurrentState     = SERVICE_RUNNING;
+    g_status.dwControlsAccepted = SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN;
+    SetServiceStatus(g_handle, &g_status);
 
-    std::thread hb(heartbeatLoop);
-    hb.detach();
+    std::thread hb(heartbeatLoop); hb.detach();
+    writeLog("Monitoring USB devices silently...");
 
-    writeLog("Monitoring USB devices...");
-    DeviceMonitor monitor;
-    g_monitor = &monitor;
-    monitor.start(onDeviceInserted);
+    DeviceMonitor mon;
+    g_mon = &mon;
+    mon.start(onDeviceInserted);
 
     writeLog("=== Service Stopped ===");
-    g_svcStatus.dwCurrentState = SERVICE_STOPPED;
-    SetServiceStatus(g_svcHandle, &g_svcStatus);
+    g_status.dwCurrentState = SERVICE_STOPPED;
+    SetServiceStatus(g_handle, &g_status);
 }
 
-// ─── Main ─────────────────────────────────────────────────────────────────────
+// ── Main ──────────────────────────────────────────────────────────────────────
 int main(int argc, char* argv[]) {
     loadConfig();
 
     if (argc > 1) {
         std::string arg(argv[1]);
 
+        // Install service
         if (arg == "--install-service") {
             SC_HANDLE mgr = OpenSCManagerA(nullptr, nullptr, SC_MANAGER_CREATE_SERVICE);
             if (!mgr) { std::cerr << "Run as Administrator!\n"; return 1; }
             char exe[MAX_PATH]; GetModuleFileNameA(nullptr, exe, MAX_PATH);
-            std::string binPath = std::string("\"") + exe + "\" --service";
-            SC_HANDLE svc = CreateServiceA(mgr, "EDTMRSAgent", "EDTMRS Endpoint Security Agent",
-                SERVICE_ALL_ACCESS, SERVICE_WIN32_OWN_PROCESS, SERVICE_AUTO_START,
-                SERVICE_ERROR_NORMAL, binPath.c_str(),
+            std::string bin = std::string("\"") + exe + "\" --service";
+            // Remove old
+            SC_HANDLE old = OpenServiceA(mgr, "EDTMRSAgent", SERVICE_STOP|DELETE);
+            if (old) { SERVICE_STATUS ss; ControlService(old, SERVICE_CONTROL_STOP, &ss);
+                       Sleep(1000); DeleteService(old); CloseServiceHandle(old); Sleep(500); }
+            SC_HANDLE svc = CreateServiceA(mgr, "EDTMRSAgent",
+                "EDTMRS Endpoint Security Agent",
+                SERVICE_ALL_ACCESS, SERVICE_WIN32_OWN_PROCESS,
+                SERVICE_AUTO_START, SERVICE_ERROR_NORMAL, bin.c_str(),
                 nullptr, nullptr, nullptr, nullptr, nullptr);
             if (svc) {
-                SERVICE_DESCRIPTIONA desc;
-                char descStr[] = "EDTMRS USB Device Threat Monitoring Agent - monitors and blocks unauthorized USB devices.";
-                desc.lpDescription = descStr;
-                ChangeServiceConfig2A(svc, SERVICE_CONFIG_DESCRIPTION, &desc);
                 SERVICE_FAILURE_ACTIONSA fa = {};
                 SC_ACTION acts[3] = {{SC_ACTION_RESTART,5000},{SC_ACTION_RESTART,10000},{SC_ACTION_RESTART,30000}};
                 fa.dwResetPeriod=86400; fa.cActions=3; fa.lpsaActions=acts;
                 ChangeServiceConfig2A(svc, SERVICE_CONFIG_FAILURE_ACTIONS, &fa);
-                std::cout << "Service installed! Starting...\n";
-                StartServiceA(svc, 0, nullptr);
-                std::cout << "Agent running silently in background.\n";
+                std::cout << "Service installed!\n";
+                if (StartServiceA(svc, 0, nullptr)) std::cout << "Service started!\n";
+                else std::cout << "Will start on next reboot.\n";
                 CloseServiceHandle(svc);
             } else {
                 std::cerr << "Install failed: " << GetLastError() << "\n";
             }
-            CloseServiceHandle(mgr);
-            return 0;
-        }
-
-        if (arg == "--remove-service") {
-            SC_HANDLE mgr = OpenSCManagerA(nullptr, nullptr, SC_MANAGER_CONNECT);
-            SC_HANDLE svc = OpenServiceA(mgr, "EDTMRSAgent", SERVICE_STOP|DELETE);
-            if (svc) {
-                SERVICE_STATUS ss; ControlService(svc, SERVICE_CONTROL_STOP, &ss);
-                Sleep(2000); DeleteService(svc);
-                std::cout << "Service removed.\n"; CloseServiceHandle(svc);
-            }
             CloseServiceHandle(mgr); return 0;
         }
 
+        // Remove service
+        if (arg == "--remove-service") {
+            SC_HANDLE mgr = OpenSCManagerA(nullptr, nullptr, SC_MANAGER_CONNECT);
+            SC_HANDLE svc = OpenServiceA(mgr, "EDTMRSAgent", SERVICE_STOP|DELETE);
+            if (svc) { SERVICE_STATUS ss; ControlService(svc, SERVICE_CONTROL_STOP, &ss);
+                       Sleep(2000); DeleteService(svc); CloseServiceHandle(svc);
+                       std::cout << "Service removed.\n"; }
+            else std::cout << "Service not found.\n";
+            CloseServiceHandle(mgr); return 0;
+        }
+
+        // SCM entry point (called by Windows on boot)
         if (arg == "--service") {
             char svcName[] = "EDTMRSAgent";
             SERVICE_TABLE_ENTRYA tbl[] = {{svcName, SvcMain},{nullptr,nullptr}};
@@ -509,43 +371,35 @@ int main(int argc, char* argv[]) {
             return 0;
         }
 
+        // Status
         if (arg == "--status") {
             SC_HANDLE mgr = OpenSCManagerA(nullptr, nullptr, SC_MANAGER_CONNECT);
             SC_HANDLE svc = OpenServiceA(mgr, "EDTMRSAgent", SERVICE_QUERY_STATUS);
             if (svc) {
                 SERVICE_STATUS ss; QueryServiceStatus(svc, &ss);
-                std::string state;
-                switch(ss.dwCurrentState) {
-                    case SERVICE_RUNNING: state="RUNNING ✅"; break;
-                    case SERVICE_STOPPED: state="STOPPED ❌"; break;
-                    default: state="OTHER";
-                }
-                std::cout << "EDTMRSAgent: " << state << "\n";
+                std::cout << "EDTMRSAgent: "
+                          << (ss.dwCurrentState==SERVICE_RUNNING ? "RUNNING" : "STOPPED") << "\n";
                 CloseServiceHandle(svc);
-            } else { std::cout << "EDTMRSAgent: NOT INSTALLED\n"; }
+            } else std::cout << "EDTMRSAgent: NOT INSTALLED\n";
             CloseServiceHandle(mgr); return 0;
         }
     }
 
-    // Console/foreground mode
-    std::cout << "\n  ===================================================\n";
-    std::cout << "   EDTMRS Endpoint Agent v" << EDTMRS_VERSION << "\n";
-    std::cout << "   REAL USB BLOCKING ENABLED\n";
-    std::cout << "  ===================================================\n\n";
-    std::cout << "  Server  : " << SERVER_HOST << ":" << SERVER_PORT << "\n";
-    std::cout << "  Host    : " << DeviceMonitor::getHostname() << "\n";
-    std::cout << "  User    : " << DeviceMonitor::getUsername() << "\n";
-    std::cout << "  Log     : " << getExeDir() << "edtmrs_agent.log\n\n";
-    std::cout << "  ⚠ Run as Administrator for blocking to work!\n\n";
-    std::cout << "  >>> PLUG IN A USB DEVICE TO TEST <<<\n\n";
+    // Console / foreground mode (for testing)
+    std::cout << "\n  ================================================\n"
+              << "   EDTMRS Agent v" EDTMRS_VERSION "\n"
+              << "  ================================================\n\n"
+              << "  Server : " << SERVER_HOST << ":" << SERVER_PORT << "\n"
+              << "  Host   : " << DeviceMonitor::getHostname() << "\n"
+              << "  User   : " << DeviceMonitor::getUsername() << "\n"
+              << "  Log    : " << getExeDir() << "edtmrs_agent.log\n\n"
+              << "  Install as service (run as Admin):\n"
+              << "    edtmrs_agent.exe --install-service\n\n"
+              << "  INSERT A USB TO TEST >>>\n\n";
 
-    // Enforce previously blocked devices
     enforceBlockedDevicesOnStartup();
-
-    std::thread hb(heartbeatLoop);
-    hb.detach();
-
-    DeviceMonitor monitor;
-    monitor.start(onDeviceInserted);
+    std::thread hb(heartbeatLoop); hb.detach();
+    DeviceMonitor mon;
+    mon.start(onDeviceInserted);
     return 0;
 }
