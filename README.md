@@ -7,7 +7,7 @@
 ![License](https://img.shields.io/badge/license-MIT-green)
 
 > **SLIIT Information Security Project (IE3092)**
-> Shimar Z.A.M — IT23215092 | Kavindya R.M.D — IT23429246
+> Shimar Z.A.M — IT23215092
 > Supervisor: Mr. Tharaniyawarma Kumaralingam
 
 ---
